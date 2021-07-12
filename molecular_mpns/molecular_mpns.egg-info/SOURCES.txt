@@ -8,6 +8,7 @@ molecular_mpns/modules.py
 molecular_mpns/proto_molecule.py
 molecular_mpns/systems.py
 molecular_mpns/utils.py
+molecular_mpns/vae.py
 molecular_mpns.egg-info/PKG-INFO
 molecular_mpns.egg-info/SOURCES.txt
 molecular_mpns.egg-info/dependency_links.txt
