@@ -1,11 +1,14 @@
 from torch_geometric.nn.models.dimenet import BesselBasisLayer, SphericalBasisLayer, EmbeddingBlock
 from torch_sparse import SparseTensor
 from torch_geometric.nn.acts import swish
-from torch_geometric.nn import radius_graph, global_mean_pool
+from torch_geometric.nn import radius_graph
 import torch
 from torch.nn import Linear
 from torch_geometric.nn.inits import glorot_orthogonal
 from torch_scatter import scatter
+from torch_geometric.data import DataLoader
+from molecular_mpns.data import AlanineDipeptideGraph
+import numpy as np
 
 
     
@@ -88,18 +91,20 @@ class OutputBlock(torch.nn.Module):
 
 class MPN(torch.nn.Module):
     
-    def __init__(self,num_spherical, num_radial, hidden_channels, num_bilinear, out_channels, num_layers, cutoff=5.0,
+    def __init__(self,num_spherical, num_radial, hidden_channels, num_bilinear, out_channels, num_layers, num_blocks = 1, cutoff=5.0,
                  envelope_exponent=5, act = swish):
         super(MPN, self).__init__()
         self.cutoff = cutoff
+        self.num_blocks = num_blocks
         self.rbf = BesselBasisLayer(num_radial, cutoff, envelope_exponent)
         self.sbf = SphericalBasisLayer(num_spherical, num_radial, cutoff,
                                        envelope_exponent)
 
         self.emb = EmbeddingBlock(num_radial, hidden_channels, act)
         
-        self.interaction = Interaction(hidden_channels, num_bilinear, num_spherical, num_radial)
-        self.output = OutputBlock(num_radial, hidden_channels, out_channels, num_layers)
+        self.output_blocks = torch.nn.ModuleList([OutputBlock(num_radial, hidden_channels, out_channels, num_layers) for _ in range(num_blocks + 1)])
+        self.interaction_blocks = torch.nn.ModuleList([Interaction(hidden_channels, num_bilinear, num_spherical, num_radial) for _ in range(num_blocks)])
+        
         
     def triplets(self, edge_index, num_nodes):
         row, col = edge_index  # j->i
@@ -142,62 +147,57 @@ class MPN(torch.nn.Module):
 
         rbf = self.rbf(dist)
         sbf = self.sbf(dist, angle, idx_kj)
-
+        
         # Embedding block.
         x = self.emb(z, rbf, i, j)
-        
-        # Interaction
-        h = self.interaction(x, rbf, sbf, idx_kj, idx_ji)
-        
-        # Output
-        h = self.output(h, rbf, i)
-        
-        h = global_mean_pool(h,batch)
-        
-        return h
+        P = self.output_blocks[0](x, rbf, i, num_nodes=pos.size(0))
+
+        # Interaction blocks.
+        for interaction_block, output_block in zip(self.interaction_blocks,
+                                                   self.output_blocks[1:]):
+            x = interaction_block(x, rbf, sbf, idx_kj, idx_ji)
+            P += output_block(x, rbf, i)
+
+        return P.sum(dim=0) if batch is None else scatter(P, batch, dim=0)
+
     
 class VAE(torch.nn.Module):
     
-    def __init__(self, num_spherical, num_radial, hidden_channels, num_bilinear, out_channels, num_layers, cutoff=5.0, zdim=2, xdim = 3*22,training = True):
+    def __init__(self, num_spherical, num_radial, hidden_channels, num_bilinear, out_channels, num_layers, num_blocks ,num_enc_lins = 4, num_dec_lins = 4, enc_act = torch.tanh, dec_act = torch.tanh, dec_hidden_channels = 256 ,dec_var_const = False, cutoff=5.0, zdim=2, xdim = 3*22,training = True):
         
         super(VAE,self).__init__()
         
-        d1,d2,d3 = 256,256,256 # hidden dimensions in network
         self.training = training
+        self.dec_var_const = dec_var_const
         
         # encoder
-        self.mpn = MPN(num_spherical, num_radial, hidden_channels, num_bilinear, out_channels, num_layers, cutoff=5.0)
+        self.mpn = MPN(num_spherical, num_radial, hidden_channels, num_bilinear, out_channels, num_layers, num_blocks, cutoff=5.0)
         
-        self.enc_lin1 = torch.nn.Linear(out_channels, out_channels)
-        self.enc_lin2 = torch.nn.Linear(out_channels, out_channels)
-        self.enc_lin3 = torch.nn.Linear(out_channels, out_channels)
-        self.enc_lin4 = torch.nn.Linear(out_channels, out_channels)
+        self.enc_act = enc_act
+        self.enc_lins = torch.nn.ModuleList()
+        for _ in range(num_enc_lins):
+            self.enc_lins.append(torch.nn.Linear(out_channels, out_channels))
         
         self.enc_mu = torch.nn.Linear(out_channels,zdim)
         self.enc_logvar = torch.nn.Linear(out_channels,zdim)
     
         # decoder
-        self.dec_lin1 = torch.nn.Linear(zdim,d1)
-        self.dec_lin2 = torch.nn.Linear(d1,d2)
-        self.dec_lin3 = torch.nn.Linear(d2,d2)
-        self.dec_lin4 = torch.nn.Linear(d2,d2)
-        
-        #self.dec_logvar = torch.nn.Parameter(torch.zeros(xdim), requires_grad=True)
-        self.dec_logvar = torch.nn.Linear(d2,xdim)
-        self.dec_mu = torch.nn.Linear(d2,xdim)
+        self.dec_act = dec_act
+        self.dec_lins = torch.nn.ModuleList()
+        for l in range(num_dec_lins):
+            if l == 0:
+                self.dec_lins.append(torch.nn.Linear(zdim,dec_hidden_channels))
+            else:
+                self.dec_lins.append(torch.nn.Linear(dec_hidden_channels, dec_hidden_channels))
+        self.dec_logvar = torch.nn.Parameter(torch.zeros(xdim), requires_grad=True) if dec_var_const else torch.nn.Linear(dec_hidden_channels, xdim)
+        self.dec_mu = torch.nn.Linear(dec_hidden_channels ,xdim)
         
     def encode(self,G_batch):
         
         h = self.mpn(G_batch.z,G_batch.pos,G_batch.batch)
-        h = self.enc_lin1(h)
-        h = torch.tanh(h)
-        h = self.enc_lin2(h)
-        h = torch.tanh(h)
-        h = self.enc_lin3(h)
-        h = torch.tanh(h)
-        h = self.enc_lin4(h)
-        h = torch.tanh(h)
         
+        for lin in self.enc_lins:
+            h = self.enc_act(lin(h))
         
         mu_enc = self.enc_mu(h)
         logvar_enc = self.enc_logvar(h)
@@ -212,22 +212,18 @@ class VAE(torch.nn.Module):
         
         return z if self.training else mu_enc
     
-    def decode(self,z):
+    def decode(self, h):
         
-        h = self.dec_lin1(z)
-        h = torch.tanh(h)
-        h = self.dec_lin2(h)
-        h = torch.tanh(h)
-        h = self.dec_lin3(h)
-        h = torch.tanh(h)
-        h = self.dec_lin4(h)
-        h = torch.tanh(h)
+        for lin in self.dec_lins:
+            h = self.dec_act(lin(h))
         
         mu_dec = self.dec_mu(h)
         
-        #batch_size = mu_dec.shape[0]
-        #logvar_dec = self.dec_logvar.repeat(batch_size, 1)
-        logvar_dec = self.dec_logvar(h)
+        if self.dec_var_const:
+            batch_size = mu_dec.shape[0]
+            logvar_dec = self.dec_logvar.repeat(batch_size, 1)
+        else:
+            logvar_dec = self.dec_logvar(h)
         
         return mu_dec, logvar_dec
     
@@ -235,6 +231,52 @@ class VAE(torch.nn.Module):
         mu_enc, logvar_enc = self.encode(G_batch)
         z = self.reparameterize(mu_enc, logvar_enc)
         return self.decode(z), mu_enc, logvar_enc
+    
+    def mwg_sample(self, z0, x0, atomic_numbers):
+        G_batch = [AlanineDipeptideGraph(z = torch.tensor(atomic_numbers).long(), pos = x0)]
+        loader = DataLoader(G_batch, batch_size = 1)
+
+        # draw proposal z_t
+        for g in loader:
+            g = g.to(self.enc_lins[0].weight.device)
+            with torch.no_grad():
+                mu_x0, logvar_x0 = self.encode(g)
+                var_x0 = torch.exp(0.5*logvar_x0)
+                znext = self.reparameterize(mu_x0, logvar_x0)
+        
+        # compute params for p(x | z)
+        with torch.no_grad():
+            mu_z0, logvar_z0 = self.decode(z0)
+            var_z0 = torch.exp(0.5*logvar_z0)
+            mu_znext, logvar_znext = self.decode(znext)
+            var_znext = torch.exp(0.5*logvar_znext)
+    
+        # compute p(x_{t-1} | z_t) and p(x_{t-1} | z_{t-1})
+        p_z0 = torch.exp(-0.5*(((x0.flatten().to(self.enc_lins[0].weight.device) - mu_z0)*(1/var_z0)).pow(2).sum()))
+        p_znext = torch.exp(-0.5*(((x0.flatten().to(self.enc_lins[0].weight.device) - mu_znext)*(1/var_znext)).pow(2).sum()))
+            
+        # compute p(z_t) and p(z_{t-1})
+        pri_z0 = torch.exp(-0.5*(z0.pow(2).sum()))
+        pri_znext = torch.exp(-0.5*(znext.pow(2).sum()))
+
+        # compute q(z_t | x_{t-1}) and q(z_{t-1} | x_{t-1})
+        q_z0 = torch.exp(-0.5*(((z0 - mu_x0)*(1/var_x0)).pow(2).sum()))
+        q_znext = torch.exp(-0.5*(((znext - mu_x0)*(1/var_x0)).pow(2).sum()))
+
+        # compute acceptance ratio
+        ar = ((p_znext/p_z0)*(pri_znext/pri_z0)*(q_z0 / q_znext)).item()
+
+        # update z0 and x0
+        u = np.random.rand()
+        accept = u < ar
+
+        z_t = znext if accept else z0
+        with torch.no_grad():
+            mu_zt, logvar_zt = self.decode(z_t)
+            x_t = self.reparameterize(mu_zt, logvar_zt)
+        x_t = x_t.reshape((22,3))
+        
+        return z_t, x_t
     
 def VAEloss(mu_dec,logvar_dec,G_batch,mu_enc,logvar_enc,L):
     
@@ -254,3 +296,4 @@ def VAEloss(mu_dec,logvar_dec,G_batch,mu_enc,logvar_enc,L):
     loss = (KLD + (1/L)*WeightedMSEloss + logvarobjective)
     
     return loss
+
