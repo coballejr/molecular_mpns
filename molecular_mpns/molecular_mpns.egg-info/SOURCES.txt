@@ -7,6 +7,7 @@ molecular_mpns/math.py
 molecular_mpns/modules.py
 molecular_mpns/proto_molecule.py
 molecular_mpns/systems.py
+molecular_mpns/training_utils.py
 molecular_mpns/utils.py
 molecular_mpns/vae.py
 molecular_mpns.egg-info/PKG-INFO
