@@ -67,11 +67,11 @@ def compare_rogs(traj_xyz_ref, traj_xyz_anc, traj_xyz_mwg, topology, filename, d
     
     return rogs_ref, rogs_anc, rogs_mwg
 
-def ancestral_sample(mod, T, device ,dim_z = 2, n_atoms = 22):
+def ancestral_sample(mod, T, device ,dim_z = 2, n_atoms = 22, sample = True):
     w = torch.randn((T, dim_z))
     with torch.no_grad():
         mu_dec, logvar_dec = mod.decode(w.to(device))
-        x_recon = mod.reparameterize(mu_dec, logvar_dec)
+        x_recon = mod.reparameterize(mu_dec, logvar_dec) if sample else mu_dec
     
     x_recon = x_recon.cpu().numpy()
     x_recon = x_recon.reshape((T, n_atoms ,3))

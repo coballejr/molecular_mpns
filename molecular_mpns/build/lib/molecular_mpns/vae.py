@@ -232,7 +232,7 @@ class VAE(torch.nn.Module):
         z = self.reparameterize(mu_enc, logvar_enc)
         return self.decode(z), mu_enc, logvar_enc
     
-    def mwg_sample(self, z0, x0, atomic_numbers):
+    def mwg_sample(self, z0, x0, atomic_numbers, sample = True):
         G_batch = [AlanineDipeptideGraph(z = torch.tensor(atomic_numbers).long(), pos = x0)]
         loader = DataLoader(G_batch, batch_size = 1)
 
@@ -242,7 +242,7 @@ class VAE(torch.nn.Module):
             with torch.no_grad():
                 mu_x0, logvar_x0 = self.encode(g)
                 var_x0 = torch.exp(0.5*logvar_x0)
-                znext = self.reparameterize(mu_x0, logvar_x0)
+                znext = self.reparameterize(mu_x0, logvar_x0) if sample else mu_x0
         
         # compute params for p(x | z)
         with torch.no_grad():
@@ -269,11 +269,12 @@ class VAE(torch.nn.Module):
         # update z0 and x0
         u = np.random.rand()
         accept = u < ar
-
+        
         z_t = znext if accept else z0
+        
         with torch.no_grad():
             mu_zt, logvar_zt = self.decode(z_t)
-            x_t = self.reparameterize(mu_zt, logvar_zt)
+            x_t = self.reparameterize(mu_zt, logvar_zt) if sample else mu_zt
         x_t = x_t.reshape((22,3))
         
         return z_t, x_t
