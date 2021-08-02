@@ -1,0 +1,13 @@
+#!/bin/bash
+#$ -M coballe@nd.edu
+#$ -m abe
+#$ -q gpu@@zabaras_v100 
+#$ -pe smp 1
+#$ -l gpu=1
+
+conda activate ptg
+python 03_train_vae_alanine_dipeptide.py
+
+
+
+
